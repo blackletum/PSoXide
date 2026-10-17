@@ -18,7 +18,8 @@ the editor and emulator share one simulation.
 | [`psx-gpu`](crates/psx-gpu) | High-level GPU API: init, primitives, framebuffers, display-window shifting. |
 | [`psx-vram`](crates/psx-vram) | Typed VRAM layout primitives: color, rect, tpage, CLUT, upload helpers. |
 | [`psx-spu`](crates/psx-spu) | High-level SPU API: typed voices, volume, pitch, ADSR, ADPCM upload, key-on/off, loop chaining, noise. |
-| [`psx-sfx`](crates/psx-sfx) | One-shot sample banks, voice allocation and playback cutoff for SPU effects. |
+| [`psx-sfx`](crates/psx-sfx) | SPU effects: sample banks, the length-based one-shot cutoff, a host-testable voice mixer (lanes, priorities, handles, virtual loops), spatial gains and master volumes. |
+| [`psx-seq`](crates/psx-seq) | Sequenced music on the SPU: a script interpreter (sequence, channel, layer), software envelopes, vibrato and portamento, and a note allocator over `psx-sfx`'s hardware seam. |
 | [`psx-settings`](crates/psx-settings) | Versioned game preferences with optional memory-card persistence. |
 | [`psx-segments`](crates/psx-segments) | Bounded segment selection and launch requests using game-owned state and controls. |
 | [`psx-display`](crates/psx-display) | Picture options: the BRIGHTNESS stepper (`DEFAULT`, `DARKER n`, `BRIGHTER n`) with its one-packet GPU overlay, and the SCREEN X/Y stepper, each with row text and a save byte. Host-tested, no heap ([adoption guide](docs/DISPLAY-OPTIONS.md)). |
@@ -57,12 +58,15 @@ Build and run them via the top-level `Makefile` (see the
 | `hello-tex` | Textured primitives + CLUT upload. |
 | `hello-ot` | Ordering-table depth sorting. |
 | `hello-input` | Controller polling via `psx-pad`. |
+| `sfxbench` | Cycles the `psx-sfx` bookkeeping costs: placement gains, the mixer's level update, an idle tick and a stealing `play`. |
+| `hello-seq` | Plays a song cooked by `psx-seq-cook` from the player's own cartridge through `psx-seq` and reports what the sequencer costs. |
 | `pollbench` | Cycles one synchronous controller poll costs: port 1, an empty port 2, both. |
 | `pad-engine-check` | The interrupt-driven pad engine against the synchronous driver: CPU left to the game, snapshot, lease. |
 | `hello-gte` | GTE-accelerated transforms. |
 | `hello-audio` | SPU voice playback. |
 | `hello-cdda` | CD-DA audio tracks. |
 | `hello-xa` | XA-ADPCM music: four generated songs interleaved in one file, played through `psx_io::cd::xa` with a pad-driven switch (`make hello-xa-disc`). |
+| `hello-xa-resume` | An XA song surviving a data read: suspends it, reads sectors through the polled reader, resumes, and checks the head, the song clock, the drive command log and the audio (`make hello-xa-resume-gate`). |
 | `hello-spstack` | A call tree run on a scratchpad stack under VBlank IRQs, checked against the RAM stack; `stack-guard` (`tools/psoxide-hazard`) proves it fits. |
 | `hello-gteirq` | RTPS run under VBlank IRQs, checking that psx-rt's handler never runs a GTE command twice. The emulator models this since its commit c7e3ea8; a console run remains the reference. |
 | `hello-present` | psx-rt's queued display flip, held until the frame's closing GP0(1Fh) sets GPUSTAT bit 24 (`arm_draw_done`, `end_with_draw_done`, `signal_draw_done`). |
@@ -73,6 +77,8 @@ Build and run them via the top-level `Makefile` (see the
 | `hello-asmprobe` | Differential test and cycle benchmark for the hand-scheduled kernels (`psx-gpu` and `psx-math` `asm-kernels`): bit-identical against the portable definition on random and edge inputs, then timed; prints `ASMPROBE PASS` or `FAIL` and `BENCH` lines. |
 | `hello-pack` | `psx_pack::cd` smoke test: streams raw and compressed WORLD.PAK chunks off the disc and checks them. |
 | `hello-cdstream` | `psx-cdstream` on a disc: single, chained, prioritised, aborted-and-resumed and sustained reads of a known file checked byte for byte, an audio lease taken mid-read, and the foreground cost of a long read (`make hello-cdstream-disc`, `make hello-cdstream-gate`). |
+| `hello-wide` | Every `psx_math::Wide` / `WideU` / `Mask64` operation against a reference built from 32-bit arithmetic only, on the target; prints `WIDE PASS` or `FAIL`. Its link map must pass the symbol gate (`make hello-wide-gate`). |
+| `hello-wide-div` | Every `psx_math::wide_div` operation (division of a `Wide` / `WideU`, 128-bit product, ratio compare) against a bit-by-bit 32-bit reference, on the target; prints `WIDEDIV PASS` or `FAIL` and the cycles per call of each. Its link map must pass the symbol gate (`make hello-wide-gate`). |
 | `hello-i64probe` | Runs software 64-bit multiply/divide/modulo on the target and checks the results; covers psx-rt's `__divdi3`/`__moddi3` overrides. |
 | `hello-icache` | Rewrites a function in cached RAM and checks that `psx_rt::cache::flush_instruction_cache` makes the CPU run the new code; prints `ICACHE PASS`, `INCONCLUSIVE` (nothing was stale) or `FAIL`. |
 | `hello-overlay` | Same-compilation Rust cold entry and resident service, caller-owned arena, scoped static-call binding and unload/re-admit generation checks. Uses its own checked packaging recipe; see [the example](examples/hello-overlay/README.md). |

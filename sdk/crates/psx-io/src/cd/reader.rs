@@ -26,8 +26,9 @@
 //! keeps CD-ROM interrupts away from the CPU for the length of a stream:
 //!
 //! * `I_MASK` is set to VBlank-only (by `prepare`, and again by each
-//!   `start_read`) until [`SectorReader::stop`] puts the previous value back. Every other source stops reaching the CPU in
-//!   between: a CD-ROM IRQ with no handler would otherwise be an unhandled-IRQ
+//!   `start_read`) until [`SectorReader::stop`] puts the previous value back,
+//!   plus whatever [`irq::keep_enabled_while_polling`] holds. Every other
+//!   source stops reaching the CPU in between: a CD-ROM IRQ with no handler would otherwise be an unhandled-IRQ
 //!   storm.
 //! * The latched CD-ROM `I_STAT` bit is acked and the controller's five IRQ
 //!   enables are switched on, then every pending controller IRQ is acked.
@@ -237,8 +238,16 @@ impl SectorReader {
     }
 
     fn wait_irq(&mut self, expected: u8, limit: u32) -> Wait {
+        self.wait_irq_with(expected, limit, &mut || {})
+    }
+
+    /// [`wait_irq`](Self::wait_irq) calling `idle` once per spin, before the
+    /// controller is looked at again, so a caller can keep servicing something
+    /// else (the pad) through a wait that runs longer than a frame.
+    fn wait_irq_with(&mut self, expected: u8, limit: u32, idle: &mut dyn FnMut()) -> Wait {
         let mut spins = 0;
         while spins < limit {
+            idle();
             let flag = self.cd.irq_flag_value();
             if flag == expected {
                 return Wait::Matched;
@@ -315,15 +324,16 @@ impl SectorReader {
     }
 
     /// Set `I_MASK` to VBlank-only, keeping the caller's mask for
-    /// [`stop`](Self::stop). Idempotent within a stream.
+    /// [`stop`](Self::stop), plus the sources [`irq::keep_enabled_while_polling`]
+    /// holds (the pad engine's). Idempotent within a stream.
     fn enter_polling_mask(&mut self) {
         self.saved_mask.keep(irq::mask());
-        irq::set_mask(1 << psx_hw::irq::source::VBLANK);
+        irq::set_mask((1 << psx_hw::irq::source::VBLANK) | irq::polling_keep());
     }
 
     fn restore_irq_mask(&mut self) {
         if let Some(mask) = self.saved_mask.take() {
-            irq::set_mask(mask);
+            irq::set_mask(mask_after_stream(mask, irq::polling_keep()));
         }
     }
 
@@ -450,6 +460,19 @@ impl SectorReader {
     /// settling; the same console that corrupts our sustained implicit-seek
     /// streams loads 1.4 MB EXEs through the BIOS bracket without fault.
     pub fn start_read_seek_first(&mut self, lba: u32, seek_poll: u32) -> bool {
+        self.start_read_seek_first_with(lba, seek_poll, &mut || {})
+    }
+
+    /// [`start_read_seek_first`](Self::start_read_seek_first) calling `idle`
+    /// while it waits for the seek to complete. A long seek (the head crossing
+    /// the disc) takes several frames, and the command sequence is otherwise
+    /// the same, in the same order; `idle` must not touch the CD controller.
+    pub fn start_read_seek_first_with(
+        &mut self,
+        lba: u32,
+        seek_poll: u32,
+        idle: &mut dyn FnMut(),
+    ) -> bool {
         self.enter_polling_mask();
         if !self.set_location(lba) {
             return false;
@@ -460,7 +483,7 @@ impl SectorReader {
         if !self.send_command(CMD_SEEKL, &[], IRQ_ACK, ACK_POLL) {
             return false;
         }
-        match self.wait_irq(IRQ_COMPLETE, seek_poll) {
+        match self.wait_irq_with(IRQ_COMPLETE, seek_poll, idle) {
             Wait::Matched => {}
             Wait::CdError | Wait::Timeout => return false,
         }
@@ -567,9 +590,25 @@ impl Default for SectorReader {
     }
 }
 
+/// The `I_MASK` to put back when a polled stream ends: the one it found, plus
+/// the sources a driver installed meanwhile asked to keep
+/// ([`irq::keep_enabled_while_polling`]). Restoring the saved word alone would
+/// drop a source (the pad engine's) that was switched on during the stream.
+const fn mask_after_stream(saved: u32, keep: u32) -> u32 {
+    saved | keep
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_kept_during_the_stream_survives_its_end() {
+        // The pad engine installed mid-stream: its bits were not in the mask
+        // the reader saved, and must not be dropped when it is put back.
+        assert_eq!(mask_after_stream(0b0101, 0b1000_0000), 0b1000_0101);
+        assert_eq!(mask_after_stream(0b0101, 0), 0b0101);
+    }
 
     #[test]
     fn the_reader_owns_the_token_and_hands_it_back() {
