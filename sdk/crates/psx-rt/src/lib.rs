@@ -27,6 +27,12 @@
 // the "feature is declared but not used" warning that shows on the
 // host target where only the panic handler + heap are live.
 #![cfg_attr(target_arch = "mips", feature(asm_experimental_arch))]
+// The console stop-panel is cold; its functions are size-optimised so a diagnostic build costs
+// as little RAM as possible.
+#![cfg_attr(
+    all(feature = "console-diag", target_arch = "mips"),
+    feature(optimize_attribute)
+)]
 
 // Corrected signed 64-bit divide/mod (compiler-builtins' are broken here).
 #[cfg(target_arch = "mips")]
@@ -39,6 +45,8 @@ mod mem;
 pub mod bios;
 pub mod cache;
 pub mod critical_section;
+#[cfg(all(feature = "console-diag", target_arch = "mips"))]
+pub mod diag;
 pub mod interrupts;
 mod peripherals;
 #[cfg(feature = "present-queue")]
@@ -284,34 +292,39 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 extern "C" fn report_panic(info: *const u8) -> ! {
     // SAFETY: `panic` passes its `&PanicInfo`, alive for the whole panic.
     let info = unsafe { &*info.cast::<core::panic::PanicInfo<'_>>() };
-    tty::print("PANIC: ");
-    if let Some(msg) = info.message().as_str() {
-        tty::print(msg);
-    }
-    tty::print("\n");
-    if let Some(loc) = info.location() {
-        tty::print("  at ");
-        tty::print(loc.file());
-        tty::print(":");
-        // Print the line number (no fmt machinery in no_std): up to 8 digits.
-        let mut line = loc.line();
-        let mut buf = [0u8; 8];
-        let mut i = buf.len();
-        if line == 0 {
-            i -= 1;
-            buf[i] = b'0';
-        }
-        while line > 0 && i > 0 {
-            i -= 1;
-            buf[i] = b'0' + (line % 10) as u8;
-            line /= 10;
-        }
-        if let Ok(s) = core::str::from_utf8(&buf[i..]) {
-            tty::print(s);
+    #[cfg(feature = "console-diag")]
+    diag::panic_panel(info);
+    #[cfg(not(feature = "console-diag"))]
+    {
+        tty::print("PANIC: ");
+        if let Some(msg) = info.message().as_str() {
+            tty::print(msg);
         }
         tty::print("\n");
+        if let Some(loc) = info.location() {
+            tty::print("  at ");
+            tty::print(loc.file());
+            tty::print(":");
+            // Print the line number (no fmt machinery in no_std): up to 8 digits.
+            let mut line = loc.line();
+            let mut buf = [0u8; 8];
+            let mut i = buf.len();
+            if line == 0 {
+                i -= 1;
+                buf[i] = b'0';
+            }
+            while line > 0 && i > 0 {
+                i -= 1;
+                buf[i] = b'0' + (line % 10) as u8;
+                line /= 10;
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[i..]) {
+                tty::print(s);
+            }
+            tty::print("\n");
+        }
+        halt()
     }
-    halt()
 }
 
 #[cfg(test)]

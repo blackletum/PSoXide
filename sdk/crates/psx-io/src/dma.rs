@@ -128,6 +128,13 @@ pub struct Transfer {
 ///   write to a busy channel, so the old transfer would keep running).
 #[inline(always)]
 pub unsafe fn start(ch: Channel, transfer: Transfer) {
+    crate::diag::dma_kick(ch as u32);
+    #[cfg(feature = "console-diag")]
+    if matches!(ch, Channel::Gpu)
+        && transfer.control & psx_hw::dma::CHCR_SYNC_LINKED == psx_hw::dma::CHCR_SYNC_LINKED
+    {
+        crate::diag::ll_scan(transfer.address);
+    }
     // SAFETY: the caller upholds this function's contract for the transfer
     // these three stores arm and start.
     unsafe {
@@ -437,12 +444,16 @@ pub fn abort(ch: Channel) {
 /// must not assume its data landed.
 pub fn wait_done(ch: Channel, spins: u32) -> bool {
     let mut waited = 0u32;
+    let which = ch as u32;
+    crate::diag::wait_begin(crate::diag::site::DMA_DONE + which, which);
     while is_busy(ch) {
         if waited >= spins {
+            crate::diag::wait_timeout(crate::diag::site::DMA_DONE + which, which, spins);
             return false;
         }
         waited += 1;
     }
+    crate::diag::wait_end();
     true
 }
 
