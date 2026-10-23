@@ -18,6 +18,26 @@ core::arch::global_asm!(
     .section .text.psx_rt_exception
     .globl __psx_rt_exception_handler
 __psx_rt_exception_handler:
+    # Console stop-panel builds: an exception taken with the cache isolated (the isolate bit of SR) means the
+    # fault is inside an instruction-cache flush, where this handler's loads and stores would
+    # reach the isolated cache and not RAM (every fault there was silent). Clear the bit first
+    # and record that it was set. Interrupts are masked for the whole flush, so only a fault can
+    # arrive here with it set.
+    .if {diag}
+    mfc0  $26, $12
+    lui   $27, {isc_hi}
+    and   $27, $26, $27
+    beqz  $27, 10f
+    nop
+    xor   $26, $26, $27
+    mtc0  $26, $12
+    nop
+    nop
+    lui   $26, %hi(__psx_diag_isc_hit)
+    addiu $27, $zero, 1
+    sw    $27, %lo(__psx_diag_isc_hit)($26)
+10:
+    .endif
     lui   $26, {io_hi}
     lw    $27, {i_stat}($26)
     lw    $26, {i_mask}($26)
@@ -304,6 +324,7 @@ __psx_rt_exception_handler:
     strict = const STRICT_FAULTS as u32,
     present = const PRESENT_QUEUE as u32,
     diag = const CONSOLE_DIAG as u32,
+    isc_hi = const crate::cache::ISOLATE_CACHE_BIT >> 16,
     // Every register the handler touches is in the I/O window, so one `lui`
     // of the window's high half reaches them all and the offsets are the low
     // halves (checked by the assertions below the block).
@@ -338,11 +359,11 @@ const _: () = {
     assert!(psx_hw::irq::I_STAT >> 16 == window && psx_hw::irq::I_MASK >> 16 == window);
     assert!(gpu::GP1 >> 16 == window && dma::DPCR >> 16 == window);
     let gpu_block = dma::CHANNEL_BASE + dma::CHANNEL_STRIDE * dma::channel::GPU;
-    assert!(gpu_block >> 16 == window && (gpu_block + dma::CHCR) & 0xFFFF < 0x8000);
+    assert!(gpu_block >> 16 == window && (gpu_block + dma::CHCR) & 0xffff < 0x8000);
     // `lui` of a GP1 word with an empty low half.
-    assert!(gpu::gp1::ACK_IRQ & 0xFFFF == 0);
+    assert!(gpu::gp1::ACK_IRQ & 0xffff == 0);
     // `ori` takes an unsigned 16-bit immediate.
-    assert!(dma::dpcr_enable(dma::channel::GPU) <= 0xFFFF);
+    assert!(dma::dpcr_enable(dma::channel::GPU) <= 0xffff);
 };
 
 /// True when psx-rt was built with the `console-diag` feature: the VBlank handler
@@ -548,7 +569,7 @@ pub const fn stray_interrupt_sources(status: u32, mask: u32, cause: u32) -> u32 
 /// ([`claim_interrupt_sources`]) left out.
 pub const fn stray_unclaimed(status: u32, mask: u32, cause: u32, claimed: u32) -> u32 {
     let pending = status & mask & !claimed;
-    let is_interrupt = (cause >> 2) & 0x1F == 0;
+    let is_interrupt = (cause >> 2) & 0x1f == 0;
     if is_interrupt && pending & (1 << psx_hw::irq::source::VBLANK) == 0 {
         pending
     } else {
@@ -749,7 +770,7 @@ const fn resume_after_fault(strict: bool, cause: u32, epc: u32, badvaddr: u32) -
     if strict {
         return None;
     }
-    match (cause >> 2) & 0x1F {
+    match (cause >> 2) & 0x1f {
         // Break, IBE
         9 | 6 => return None,
         // AdEL on the fetch itself
@@ -1096,12 +1117,12 @@ mod tests {
     const EPC: u32 = 0x8001_2340;
 
     /// GTE commands the SDK issues, as their encoded words.
-    const RTPS: u32 = 0x4A18_0001;
-    const RTPT: u32 = 0x4A28_0030;
-    const NCLIP: u32 = 0x4B40_0006;
-    const MVMVA: u32 = 0x4A48_6012;
-    const AVSZ3: u32 = 0x4B58_002D;
-    const GPF: u32 = 0x4B90_003D;
+    const RTPS: u32 = 0x4a18_0001;
+    const RTPT: u32 = 0x4a28_0030;
+    const NCLIP: u32 = 0x4b40_0006;
+    const MVMVA: u32 = 0x4a48_6012;
+    const AVSZ3: u32 = 0x4b58_002d;
+    const GPF: u32 = 0x4b90_003d;
 
     #[test]
     fn an_interrupt_on_a_gte_command_resumes_after_it() {
@@ -1114,12 +1135,12 @@ mod tests {
     #[test]
     fn psx_spx_mask_and_seven_bit_test_agree() {
         // Every top byte, with the rest of the word set both ways.
-        for top in 0u32..=0xFF {
-            for low in [0, 0x00FF_FFFF] {
+        for top in 0u32..=0xff {
+            for low in [0, 0x00ff_ffff] {
                 let word = (top << 24) | low;
                 assert_eq!(
                     is_gte_command(word),
-                    word & 0xFE00_0000 == 0x4A00_0000,
+                    word & 0xfe00_0000 == 0x4a00_0000,
                     "{word:#010x}"
                 );
             }
@@ -1129,18 +1150,18 @@ mod tests {
     #[test]
     fn gte_register_moves_and_loads_resume_at_epc() {
         let not_commands = [
-            0x480C_6000, // mfc2 $12, SXY0
+            0x480c_6000, // mfc2 $12, SXY0
             0x4889_6000, // mtc2 $9, SXY0
-            0x4842_F800, // cfc2 $2, FLAG
-            0x48C2_C000, // ctc2 $2, OFX
-            0xC885_0000, // lwc2 $5, 0($4)
-            0xE8AC_0000, // swc2 $12, 0($5)
+            0x4842_f800, // cfc2 $2, FLAG
+            0x48c2_c000, // ctc2 $2, OFX
+            0xc885_0000, // lwc2 $5, 0($4)
+            0xe8ac_0000, // swc2 $12, 0($5)
             0x4900_0003, // bc2f
             0x4901_0003, // bc2t
             0x4080_6000, // mtc0 $0, SR
             0x0000_0000, // nop
-            0x8C82_0000, // lw $2, 0($4)
-            0x03E0_0008, // jr $ra
+            0x8c82_0000, // lw $2, 0($4)
+            0x03e0_0008, // jr $ra
         ];
         for word in not_commands {
             assert!(!is_gte_command(word), "{word:#010x}");
@@ -1157,12 +1178,12 @@ mod tests {
         // EPC + 8 would drop the branch target; neither is safe, which is
         // why the answer is to keep GTE commands out of delay slots.
         let branches = [
-            0x1509_FFF0, // bne $8, $9, back
+            0x1509_fff0, // bne $8, $9, back
             0x1000_0004, // b forward
-            0x0C00_4000, // jal
+            0x0c00_4000, // jal
             0x0800_4000, // j
-            0x0100_F809, // jalr $8
-            0x03E0_0008, // jr $ra
+            0x0100_f809, // jalr $8
+            0x03e0_0008, // jr $ra
         ];
         for branch in branches {
             assert_eq!(interrupt_resume_pc(EPC, branch), EPC, "{branch:#010x}");
@@ -1171,8 +1192,8 @@ mod tests {
 
     #[test]
     fn the_resume_address_wraps_like_the_hardware_add() {
-        assert_eq!(interrupt_resume_pc(0xFFFF_FFFC, RTPS), 0);
-        assert_eq!(resume_after_fault(false, DBE, 0xFFFF_FFFC, 0), Some(0));
+        assert_eq!(interrupt_resume_pc(0xffff_fffc, RTPS), 0);
+        assert_eq!(resume_after_fault(false, DBE, 0xffff_fffc, 0), Some(0));
     }
 
     // Fault path. Cause values are ExcCode << 2, plus CAUSE_BD.
@@ -1227,7 +1248,7 @@ mod tests {
         // bne $8, $9, -4 at EPC with an RTPS in its slot. An interrupt there
         // resumes at the branch, so both run again (documented above); a
         // fault there (Coprocessor Unusable with SR.CU2 clear, say) halts.
-        let bne = 0x1509_FFFC;
+        let bne = 0x1509_fffc;
         assert_eq!(interrupt_resume_pc(EPC, bne), EPC);
         assert_eq!(
             resume_after_fault(false, CPU | psx_hw::cop0::CAUSE_BD, EPC, 0),
@@ -1251,7 +1272,7 @@ mod tests {
     }
 
     // Vector words: a BIOS stub, psx-rt's jump, and a game wrapper's jump.
-    const BIOS_STUB: u32 = 0x3C1A_0000;
+    const BIOS_STUB: u32 = 0x3c1a_0000;
     const RT_JUMP: u32 = 0x0800_4000;
     const GAME_JUMP: u32 = 0x0800_8000;
 

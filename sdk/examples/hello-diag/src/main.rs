@@ -6,6 +6,8 @@
 //!
 //! * `stall`: spins forever with interrupts on, no GPU and no CD activity;
 //! * `fault`: executes a `BREAK`, as `panic=immediate-abort` does;
+//! * `wild`: jumps to an address no code lives at (the console's Quake freeze went to
+//!   `B428AD34`), to show the panel's WILD PC row;
 //! * `panic`: a panic with a message (this crate is built without
 //!   `panic=immediate-abort`, so the message path runs);
 //! * `cd`: asks the drive for a sector that is not there, to put its error
@@ -81,6 +83,14 @@ fn main() {
                 // SAFETY: a BREAK on purpose; psx-rt's handler halts on it.
                 unsafe { core::arch::asm!("break") };
             }
+            if is("wild") {
+                psx_io::diag::step(8, "WILD JUMP");
+                // SAFETY: a jump to nowhere on purpose; the fetch takes a bus error that
+                // psx-rt's handler halts on.
+                unsafe {
+                    core::arch::asm!("jr {t}", "nop", t = in(reg) 0xB428_AD34u32, options(noreturn))
+                };
+            }
             if is("panic") {
                 psx_io::diag::step(4, "PANIC");
                 panic!("hello-diag test panic at frame {}", frame);
@@ -92,7 +102,7 @@ fn main() {
                 // SAFETY: a private static written once before the kick, as the DMA contract asks.
                 unsafe {
                     let node = &raw mut NODE;
-                    (*node)[0] = (41 << 24) | 0x00FF_FFFF;
+                    (*node)[0] = (41 << 24) | 0x00ff_ffff;
                     psx_io::dma::wait_done(psx_io::dma::Channel::Gpu, 1_000_000);
                     psx_io::dma::start(
                         psx_io::dma::Channel::Gpu,

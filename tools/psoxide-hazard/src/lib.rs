@@ -5,6 +5,8 @@
 //!   moving any code, and rescans.
 //! * [`scan`] (`hazard-scan`) proves an image free of those hazards,
 //!   whatever built it.
+//! * [`cache_gate`] (`cache-gate`) proves nothing outside the SDK's flush routines writes the
+//!   cache control register or isolates the cache.
 //! * [`stack_guard`] (`stack-guard`) proves every scratchpad stack call tree
 //!   fits its region.
 //!
@@ -15,6 +17,7 @@
 
 use std::io::Write;
 
+pub mod cache_gate;
 pub mod detect;
 pub mod linkmap;
 pub mod listing;
@@ -157,7 +160,7 @@ pub fn text_bounds(
         Some(1)
     })?;
     let (lo, hi) = map.text;
-    if !(0x8001_0000 <= lo && lo < hi && hi <= 0x801F_8000) {
+    if !(0x8001_0000 <= lo && lo < hi && hi <= 0x801f_8000) {
         let _ = writeln!(out, "implausible .text bounds {lo:#x}..{hi:#x}");
         return Err(Some(1));
     }
