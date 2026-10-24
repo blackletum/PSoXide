@@ -10,6 +10,7 @@ pub mod gen;
 pub mod n64;
 pub mod render;
 pub mod rom;
+pub mod sfx;
 pub mod survey;
 
 /// Errors from reading and cooking.
@@ -70,5 +71,81 @@ mod tests {
             }
         }
         assert!(found >= 12, "the song's instruments are present: {found}");
+    }
+
+    /// Cook two songs of one area against one bank: the bank holds both
+    /// songs' instruments once, the ADPCM starts on the requested boundary,
+    /// and the tables alone parse without the samples.
+    #[test]
+    fn songs_of_one_area_share_a_bank() {
+        let (Ok(rom), Ok(seg)) = (
+            std::env::var("PSX_SEQ_TEST_ROM"),
+            std::env::var("PSX_SEQ_TEST_SEGMENTS"),
+        ) else {
+            return;
+        };
+        let rom =
+            crate::rom::Rom::load(std::path::Path::new(&rom), std::path::Path::new(&seg)).unwrap();
+        let data = crate::n64::AudioData::load(&rom).unwrap();
+        let options = crate::cook::Options {
+            adpcm_align: 2048,
+            ..crate::cook::Options::default()
+        };
+        // KOKIRI (60) and LINK_HOUSE (31) draw on the same sample banks.
+        let set = crate::cook::cook_songs(&data, &[60, 31], &options).unwrap();
+        assert_eq!(set.songs.len(), 2);
+        let bank = psx_seq::format::Bank::parse(&set.bank).unwrap();
+        let (off, len) = bank.adpcm_range();
+        assert_eq!(off % 2048, 0, "ADPCM starts on a sector boundary");
+        assert_eq!(bank.adpcm().len(), len as usize);
+        let tables = psx_seq::format::Bank::parse_tables(&set.bank[..bank.tables_used()]).unwrap();
+        assert!(tables.adpcm().is_empty());
+        assert_eq!(tables.sample_count(), bank.sample_count());
+        // Shared samples are cooked once: the pair costs less than the two alone.
+        let alone: usize = [60usize, 31]
+            .iter()
+            .map(|&id| {
+                let one = crate::cook::cook_song(&data, id, &options).unwrap();
+                psx_seq::format::Bank::parse(&one.bank)
+                    .unwrap()
+                    .adpcm()
+                    .len()
+            })
+            .sum();
+        assert!(bank.adpcm().len() < alone);
+    }
+
+    /// The effects sequence, run on the host, plays sounds: a rupee pickup is one voice of a
+    /// short sample, an index past the end of a bank is refused, and a sound that a second
+    /// request would change (the enemy bank's ninth index bit) differs.
+    #[test]
+    fn effects_come_from_the_effects_sequence() {
+        let (Ok(rom), Ok(seg)) = (
+            std::env::var("PSX_SEQ_TEST_ROM"),
+            std::env::var("PSX_SEQ_TEST_SEGMENTS"),
+        ) else {
+            return;
+        };
+        let rom =
+            crate::rom::Rom::load(std::path::Path::new(&rom), std::path::Path::new(&seg)).unwrap();
+        let data = crate::n64::AudioData::load(&rom).unwrap();
+        let probe = crate::sfx::EffectProbe::new(&data).unwrap();
+        let rupee = probe.play(0x4803).unwrap();
+        assert_eq!(rupee.len(), 1, "{rupee:?}");
+        assert!(rupee[0].left > 0 && rupee[0].pitch_q12 > 0);
+        assert!(
+            probe.play(0x0800 + 224).is_err(),
+            "the player bank has 224 sounds"
+        );
+        assert!(probe.play(0x7800).is_err(), "there is no bank 7");
+        let low = probe.play(0x3800 + 92).unwrap();
+        let high = probe.play(0x3800 + 256 + 92).unwrap();
+        assert_ne!(
+            low[0].source, high[0].source,
+            "index bit 8 selects another script"
+        );
+        let set = crate::sfx::cook_effects(&data, &[0x4803, 0x083e]).unwrap();
+        assert_eq!(set.effects.len(), 2);
+        assert!(!set.samples.is_empty());
     }
 }

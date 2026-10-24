@@ -65,6 +65,32 @@
 //! }
 //! ```
 //!
+//! # Next to the polled reader
+//!
+//! A program that loads with `SectorReader` (maps, tables, boot assets) and only
+//! wants some reads kept out of the frame loop (a weapon model that streams in
+//! while the world renders) has two ways to use this crate without giving up the
+//! polled reader.
+//!
+//! The cheap one is [`drain`]: start the read with the polled reader as always,
+//! hand its sectors to the CD interrupt with `drain::start`, look at
+//! `drain::poll` once a frame and end the read with the reader's `stop`. There is
+//! no transport, so it costs about 1.4 KB of RAM where the transport is about 9 KB
+//! in a game built with profile-guided optimisation, and every command still goes
+//! out through the polled path that has been proved on a console. A polled read
+//! at 150 sectors a second needs a call every 6.7 ms and loses sectors when the
+//! frame loop looks once per frame (the controller keeps a few, and delivers the
+//! newest); the handler has no such limit.
+//!
+//! The full one is the transport below, for a program that can route its reads
+//! through it: call [`ensure_installed`] with [`IrqMaskPolicy::OnlyWhileBusy`]
+//! before a read (it also puts the wrapper back after `install_vblank_counter`
+//! reset the exception vector), submit the request, and look at it once a frame.
+//! Between requests the CD interrupt source is closed and the polled reader works
+//! as before; before a polled command, [`stop_and_wait`] ends a request still in
+//! flight. Use one or the other in a program, not both at once: each puts a
+//! wrapper in the exception vector and both would answer a CD interrupt.
+//!
 //! # How it is built
 //!
 //! [`Engine`] is the whole state machine, generic over [`CdHw`], the
@@ -94,6 +120,8 @@ mod request;
 mod console;
 #[cfg(any(target_arch = "mips", doc))]
 pub use console::*;
+#[cfg(any(target_arch = "mips", doc))]
+pub mod drain;
 
 pub use engine::*;
 pub use hw::CdHw;
