@@ -56,8 +56,12 @@
 //! a Rust SDK instead of a C one.
 
 #![no_std]
+#![feature(optimize_attribute)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
+
+pub mod layout;
+pub mod map;
 
 use psx_hw::gpu::{gp0, gp1, pack_xy};
 use psx_io::dma::{self, Channel};
