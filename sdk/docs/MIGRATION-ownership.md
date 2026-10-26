@@ -45,7 +45,7 @@ Every command and register step in `psx_io::cd` is a method on `&mut Cd`:
 | `cd::play_track`, `try_play_track`, `pause`, `try_pause`, `try_pause_until_complete`, `stop`, `try_stop`, `stop_and_settle` | the same names as methods |
 | `cd::mute`, `unmute`, `try_mute`, `try_unmute`, `play_position`, `try_play_position`, `try_command_until_complete`, `set_audio_mixer` | the same names as methods |
 | `cd::irq_flag_value`, `acknowledge_irq`, `discard_response`, `dispatch_command`, `restore_irq_output`, `poll_data_sector`, `try_wait_data_sector` | the same names as methods |
-| `psx_io::cdrom::*` (the module that was already deprecated) | forwards to the methods |
+| `psx_io::cdrom::*` (the module that was already deprecated) | removed on 2026-10-25; the same names are methods on `Cd` |
 | `PlaybackStarter::tick(now, track)` | `tick_on(&mut cd, now, track)` |
 | `PlaybackClock::tick(now)` | `tick_on(&mut cd, now)` |
 
@@ -213,10 +213,10 @@ references need the new signature on repin.
 
 ## Ordering-table clear (`OrderingTableClearDma`)
 
-`dma::clear_ordering_table(buf)` is `OrderingTableClearDma::clear_table(&mut
-self, buf)`. psx-gpu's `OrderingTable::clear_with_dma` already took the token
-and now runs the clear through it. Call sites: the editor engine's
-`engine/examples/hardware-tests/src/main.rs` (1).
+`dma::clear_ordering_table(buf)` (removed on 2026-10-25) is
+`OrderingTableClearDma::clear_table(&mut self, buf)`. psx-gpu's
+`OrderingTable::clear_with_dma` already took the token and now runs the clear
+through it.
 
 ## DPCR updates are atomic with respect to the VBlank handler (io-05)
 

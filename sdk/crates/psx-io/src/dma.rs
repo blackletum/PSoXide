@@ -35,13 +35,6 @@ pub enum Channel {
     OrderingTableClear = 6,
 }
 
-#[allow(non_upper_case_globals)]
-impl Channel {
-    /// Renamed to [`Channel::Cd`].
-    #[deprecated(note = "renamed to `Channel::Cd`")]
-    pub const Cdrom: Channel = Channel::Cd;
-}
-
 impl Channel {
     /// Address of this channel's register block.
     #[inline(always)]
@@ -226,55 +219,12 @@ pub mod raw {
     }
 }
 
-/// Write the channel's RAM address register.
-///
-/// # Safety
-///
-/// The value arms or starts a transfer on `ch`; see [`start`]'s contract.
-#[deprecated(
-    note = "a safe address store lets safe code aim DMA anywhere in RAM; use the unsafe `dma::start`, or `dma::raw::set_address` for probes"
-)]
-#[inline(always)]
-pub unsafe fn set_madr(ch: Channel, addr: u32) {
-    // SAFETY: forwarded contract.
-    unsafe { raw::set_address(ch, addr) }
-}
-
 /// Read the channel's RAM address register.
 #[doc(alias = "MADR")]
 #[inline(always)]
 pub fn address(ch: Channel) -> u32 {
     // SAFETY: a side-effect-free read of this channel's address register.
     unsafe { crate::read_u32(ch.register_base() + reg::MADR) }
-}
-
-/// Write the size register in manual / linked-list mode: just a 16-bit word
-/// count.
-///
-/// # Safety
-///
-/// The value arms or starts a transfer on `ch`; see [`start`]'s contract.
-#[deprecated(
-    note = "use the unsafe `dma::start` with `dma::size_words`, or `dma::raw::set_size` for probes"
-)]
-#[inline(always)]
-pub unsafe fn set_bcr_manual(ch: Channel, words: u16) {
-    // SAFETY: forwarded contract.
-    unsafe { raw::set_size(ch, size_words(words)) }
-}
-
-/// Write the control register. Starts the transfer if `CHCR_START` is set.
-///
-/// # Safety
-///
-/// The value arms or starts a transfer on `ch`; see [`start`]'s contract.
-#[deprecated(
-    note = "a safe control store starts DMA from safe code; use the unsafe `dma::start`, `dma::abort` to stop a channel, or `dma::raw::set_control` for probes"
-)]
-#[inline(always)]
-pub unsafe fn set_chcr(ch: Channel, value: u32) {
-    // SAFETY: forwarded contract.
-    unsafe { raw::set_control(ch, value) }
 }
 
 /// Read the channel's control register.
@@ -320,15 +270,6 @@ impl OrderingTableClearDma {
     pub fn clear_table(&mut self, buf: &mut [u32]) -> bool {
         clear_table(buf)
     }
-}
-
-/// [`OrderingTableClearDma::clear_table`] on a token the caller does not hold.
-#[deprecated(note = "use `OrderingTableClearDma::clear_table` with the token")]
-#[inline(always)]
-pub fn clear_ordering_table(buf: &mut [u32]) -> bool {
-    // SAFETY: a token is a logic guard, not a memory-safety one (see
-    // `crate::periph`), and the old function never took one.
-    unsafe { OrderingTableClearDma::steal() }.clear_table(buf)
 }
 
 fn clear_table(buf: &mut [u32]) -> bool {
