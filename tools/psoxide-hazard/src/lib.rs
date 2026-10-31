@@ -29,6 +29,7 @@ pub mod patch;
 pub mod scan;
 pub mod stack_guard;
 pub mod text;
+pub mod window_gate;
 
 use detect::Unlisted;
 use linkmap::LinkMap;
