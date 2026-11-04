@@ -242,6 +242,118 @@ pub fn command_reset_count() -> u32 {
     unsafe { core::ptr::addr_of!(COMMAND_RESETS).read_volatile() }
 }
 
+/// The draw-done sequence ([`psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE`]) as one
+/// linked-list node, then the end of the list. Shared by
+/// `psx_gpu::chain::DRAW_DONE_NODE` and [`signal_draw_done`]. A `static mut`
+/// only so that [`set_draw_done_scratch`] can move the filled block; nothing
+/// else writes it.
+static mut DRAW_DONE_LIST: [u32; 1 + psx_hw::gpu::gp0::DRAW_DONE_WORDS] = {
+    let mut list = [0u32; 1 + psx_hw::gpu::gp0::DRAW_DONE_WORDS];
+    list[0] = ((psx_hw::gpu::gp0::DRAW_DONE_WORDS as u32) << psx_hw::dma::linked_list::LENGTH_SHIFT)
+        | psx_hw::dma::linked_list::END;
+    let mut i = 0;
+    while i < psx_hw::gpu::gp0::DRAW_DONE_WORDS {
+        list[1 + i] = psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE[i];
+        i += 1;
+    }
+    list
+};
+
+/// Pointer to the draw-done list (a node chains can end on).
+#[inline]
+pub fn draw_done_list() -> *const u32 {
+    core::ptr::addr_of!(DRAW_DONE_LIST).cast::<u32>()
+}
+
+/// Move the 16 x 8 block the draw-done sequence fills with black to `(x, y)`,
+/// for a game that keeps data in the default one (the bottom right corner of
+/// VRAM, [`psx_hw::gpu::gp0::DRAW_DONE_SCRATCH`]). Call it once at start, before
+/// the first frame is submitted: it waits for channel 2 to go idle (bounded)
+/// and rewrites the three fill coordinates in place.
+///
+/// `x` must be a multiple of 16 (GP0(02h) rounds it down) and the block must
+/// lie inside VRAM and stay unused.
+pub fn set_draw_done_scratch(x: u16, y: u16) {
+    assert!(x % 16 == 0 && x <= 1008 && y <= 504, "the scratch block must fit VRAM");
+    #[cfg(target_arch = "mips")]
+    let _ = crate::dma::wait_done(crate::dma::Channel::Gpu, crate::dma::DEFAULT_SPINS);
+    let at = psx_hw::gpu::pack_xy(x, y);
+    // SAFETY: the list is only read by a channel 2 walk, which is idle; the three words
+    // are the fills' coordinate words in the sequence (list index = word index + 1).
+    unsafe {
+        let list = core::ptr::addr_of_mut!(DRAW_DONE_LIST).cast::<u32>();
+        for fill in 0..3 {
+            list.add(1 + 4 * fill + 2).write_volatile(at);
+        }
+    }
+}
+
+/// Close immediate drawing so that GPUSTAT bit 24 ([`GpuStat::IRQ1`]) rises
+/// once it is drawn: send the draw-done sequence
+/// ([`psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE`], GP0(1Fh) requests with fills of
+/// a scratch block between them, see its documentation for why one request is
+/// not enough on an FPGA PSX core).
+///
+/// The words go to the GPU as one DMA channel 2 linked-list node, back to
+/// back, because the fix depends on the later requests already being queued
+/// behind the fills; a write-by-write port path waiting on GPUSTAT bit 26
+/// would hand each request to an idle GPU. With a command recording open
+/// (`present-queue`) the words are recorded instead. Otherwise an armed
+/// direct-access guard runs first, a walk still running on the channel is
+/// waited out (aborted if it is wedged: [`psx_hw::dma`] spin budget), the
+/// list is kicked and waited out again. Every wait is bounded.
+#[inline(never)]
+pub fn signal_draw_done() {
+    #[cfg(any(feature = "present-queue", test))]
+    if handoff::is_recording() {
+        write_commands(&psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE);
+        return;
+    }
+    run_direct_access_guard();
+    kick_draw_done_list();
+}
+
+/// [`signal_draw_done`] past the direct-access guard and any recording, for
+/// code that has already made the port and the channel safe (the present
+/// queue's stall recovery, which the guard itself runs).
+#[cold]
+#[inline(never)]
+pub fn signal_draw_done_unguarded() {
+    kick_draw_done_list();
+}
+
+fn kick_draw_done_list() {
+    use crate::dma::{self, Channel};
+    if !dma::wait_done(Channel::Gpu, dma::DEFAULT_SPINS) {
+        dma::abort(Channel::Gpu);
+        write_display_control_unguarded(psx_hw::gpu::gp1::RESET_CMD_BUFFER);
+    }
+    // Games re-route DMA for VRAM readback and do not always restore it.
+    write_display_control_unguarded(psx_hw::gpu::gp1::dma_direction(
+        psx_hw::gpu::DmaDirection::CpuToGp0 as u32,
+    ));
+    dma::enable_channel(Channel::Gpu);
+    // SAFETY: the channel is idle (waited out or aborted above) and the list is
+    // immutable static RAM that outlives the walk, which is waited out below.
+    unsafe {
+        dma::start_unguarded(
+            Channel::Gpu,
+            dma::Transfer {
+                address: draw_done_list() as usize as u32,
+                size: dma::size_words(0),
+                control: psx_hw::dma::CHCR_TO_DEVICE
+                    | psx_hw::dma::CHCR_SYNC_LINKED
+                    | psx_hw::dma::CHCR_START,
+            },
+        );
+    }
+    if !dma::wait_done(Channel::Gpu, dma::DEFAULT_SPINS) {
+        dma::abort(Channel::Gpu);
+        write_display_control_unguarded(psx_hw::gpu::gp1::RESET_CMD_BUFFER);
+    }
+    dma::compiler_barrier();
+}
+
 /// Spin until the GPU can start a DMA block transfer.
 #[inline]
 pub fn wait_dma_ready() {
@@ -282,6 +394,42 @@ fn poll_ready(spin_limit: u32, mut ready: impl FnMut() -> bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The draw-done kick runs inside the present queue's stall recovery, which a
+    /// scratchpad stack call tree reaches: the stack guard cannot bound a call
+    /// through a register, and `dma::start` stores the channel address through
+    /// the direct-access guard's function pointer. It must use
+    /// `dma::start_unguarded` (Cortex's build was refused for this).
+    #[test]
+    fn the_draw_done_kick_never_reaches_the_direct_access_guard() {
+        let source = include_str!("gpu.rs");
+        let from = source.find("fn kick_draw_done_list()").expect("the kick exists");
+        let body = &source[from..];
+        let body = &body[..body.find("\n}\n").expect("the kick ends")];
+        assert!(body.contains("dma::start_unguarded("), "the kick starts the walk unguarded");
+        assert!(!body.contains("dma::start("), "dma::start runs the guard on its address store");
+        assert!(!body.contains("raw::set_address"), "raw::set_address runs the guard");
+        assert!(!body.contains("run_direct_access_guard"), "the kick is already past the guard");
+    }
+
+    #[test]
+    fn the_scratch_block_can_be_moved_and_the_list_stays_well_formed() {
+        let words = psx_hw::gpu::gp0::DRAW_DONE_WORDS;
+        let list = || unsafe { core::slice::from_raw_parts(draw_done_list(), 1 + words) };
+        assert_eq!(&list()[1..], &psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE);
+        set_draw_done_scratch(960, 488);
+        let at = psx_hw::gpu::pack_xy(960, 488);
+        for fill in 0..3 {
+            assert_eq!(list()[1 + 4 * fill], psx_hw::gpu::gp0::REQUEST_IRQ);
+            assert_eq!(list()[1 + 4 * fill + 1], psx_hw::gpu::gp0::FILL_RECT);
+            assert_eq!(list()[1 + 4 * fill + 2], at);
+            assert_eq!(list()[1 + 4 * fill + 3], psx_hw::gpu::pack_xy(16, 8));
+        }
+        assert_eq!(list()[words], psx_hw::gpu::gp0::REQUEST_IRQ);
+        assert_eq!(list()[0] >> 24, words as u32);
+        set_draw_done_scratch(1008, 504);
+        assert_eq!(&list()[1..], &psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE);
+    }
+
     #[test]
     fn readiness_budget_includes_initial_probe() {
         for limit in 0..5 {

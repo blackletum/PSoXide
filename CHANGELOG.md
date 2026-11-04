@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+No program depends on a BIOS any more, not a call into one and not the state one leaves behind (Manny's rule:
+every program works on every Sony BIOS and on OpenBIOS).
+
+- GP0(1Fh) is no longer sent alone (FPGA PSX cores lose it): `psx_hw::gpu::gp0::DRAW_DONE_SEQUENCE` is one 13-word
+  node, GP0(1Fh) and a 16 x 8 fill of a block at the corner of VRAM (`DRAW_DONE_SCRATCH`, 1008,504, never handed out
+  by `psx_vram::VramAllocator`; `psx_io::gpu::set_draw_done_scratch` moves it for a game that keeps data there),
+  three times. MiSTer's PSX core raises GPUSTAT bit 24 and I_STAT bit 1 only for a request popped on an odd clk2x
+  edge; an idle GPU pops on an even one every time, a request queued behind a fill lands 3 + 4 * 8 edges after it
+  starts, an odd edge, whatever came before. `psx_gpu::chain::DRAW_DONE_NODE` is that node (its list lives in
+  `psx_io::gpu`), and `Gpu::signal_draw_done` / `psx_io::gpu::signal_draw_done` kick it through DMA channel 2 with
+  bounded waits (recorded as words while a present-queue recording is open) instead of writing one word through
+  the port. psx-rt's VBlank handler also releases a queued display word or a published present-queue chain when
+  GPUSTAT bit 24 is down but DMA 2 is idle and bits 26 and 28 were up on the previous edge as well
+  (`psx_rt::interrupts::draw_done_fallback_count` counts it; 0 on a PS1): a lost request costs one VBlank instead
+  of a timeout. Silicon ignores the repeats once bit 24 is set.
+- `psx_rt::tty` is off unless the `host-tty` feature is on (`console-diag` turns it on): `print`, `println` and
+  `print_hex_u32` compile to nothing without it, and with it each byte is one store to the Expansion 2 debug
+  console (`psx_hw::memory::expansion2::DEBUG_CONSOLE`), where PCSX-Redux, OpenBIOS and our emulator print it.
+  `psx_rt::bios` and its `A(3Ch)` trampoline are gone, so the SDK makes no BIOS call at all. A game whose gate
+  reads the terminal asks for `host-tty` in that build; the SDK examples do. `boot-trace` only prints with
+  `host-tty` as well.
+- `psx_rt::entry::set_entry_state` writes one documented state before `main`: cop0 SR (CU2 only, interrupts off),
+  `I_MASK` and `I_STAT`, every DMA channel quiesced then `DPCR` (`psx_hw::dma::DPCR_ENTRY`, the controller's own
+  priority ladder, nothing enabled) and `DICR`, the root counters' modes, SIO0, the SPU (voices off, reverb and
+  modulation off, main volume at its maximum, CD input volume silent and CD audio off, enabled and unmuted) and the
+  cache control register. `_start` calls it, and the demo disc's chain loader calls it between programs. A Sony
+  console was measured handing over `DPCR` 0x9099, not 0x07654321, and other BIOS versions and OpenBIOS differ again.
+- `entry` also writes the memory controller's seven access-timing registers (`psx_hw::memory::timing::ENTRY`: the
+  CD-ROM, SPU, expansion, BIOS ROM and common delays, which BIOS versions and OpenBIOS set differently) and zeroes
+  every GTE register; the census keeps the timing words the BIOS left.
+- `boot-trace` now implies `host-tty`. Feature `entry-census` keeps the registers the program found at start
+  (`psx_rt::entry::inherited`) for the hardware tests to report; off by default.
+- `SectorReader::prepare` no longer trusts the drive to be idle on its first call: it asks GetStat and stops a
+  drive that is reading, seeking or playing with the proven Pause (`pause::settle_drive`). An idle drive gets no
+  Pause. `hello-cdpause` takes the drive over from a running read and from a Pause in flight.
+
 Added `psx_rt::scratchpad_window` (feature `scratchpad-window`, off by default, programs that leave it off are
 byte-identical): a stack window on the scratchpad for whole call trees with hop-back to the RAM stack at guarded
 callees (`window_fn!`), and `window-gate` in psoxide-hazard, run by psoxide-pgo after every link, which proves from
