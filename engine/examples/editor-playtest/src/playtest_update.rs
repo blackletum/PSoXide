@@ -393,6 +393,7 @@ impl Playtest {
             now,
         );
         self.apply_logic_hazard_damage(ctx);
+        self.debug_gate_state(now.as_u32(), player_pos, hazard_exempt);
         self.dispatch_logic_effects(ctx.controller_port());
         self.sync_sliding_doors();
         telemetry::counter(

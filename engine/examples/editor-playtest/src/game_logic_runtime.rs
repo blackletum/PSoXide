@@ -1880,6 +1880,71 @@ impl Playtest {
         }
     }
 
+    /// TEMPORARY debug: one line whenever the gate signature changes.
+    pub(super) fn debug_gate_state(&mut self, now: u32, player: [i32; 3], exempt: bool) {
+        static mut LAST: u64 = u64::MAX;
+        let mut sig = 0u64;
+        let mut line = [0u8; 120];
+        let mut n = 0usize;
+        let mut put = |b: u8, n: &mut usize| {
+            if *n < 120 {
+                line[*n] = b;
+                *n += 1;
+            }
+        };
+        let mask = self.visual_switch_mask();
+        sig |= u64::from(mask) << 32;
+        let mut bit = 0;
+        for (i, r) in LOGIC.iter().enumerate() {
+            let on = self.logic.is_on(LOGIC.as_slice(), i);
+            if r.kind == psx_level::logic_kind::TIMER {
+                put(b'T', &mut n);
+                put(b'0' + on as u8, &mut n);
+                sig |= (on as u64) << bit;
+                bit += 1;
+            } else if r.kind == psx_level::logic_kind::HAZARD {
+                let inside = player[0] >= r.min[0] && player[0] <= r.max[0]
+                    && player[1] >= r.min[1] && player[1] <= r.max[1]
+                    && player[2] >= r.min[2] && player[2] <= r.max[2];
+                put(b'H', &mut n);
+                put(b'0' + on as u8, &mut n);
+                put(if inside { b'I' } else { b'o' }, &mut n);
+                sig |= (on as u64) << bit;
+                sig |= (inside as u64) << (bit + 1);
+                bit += 2;
+            }
+        }
+        put(b' ', &mut n);
+        put(b'm', &mut n);
+        for k in (0..8).rev() {
+            put(b"0123456789abcdef"[((mask >> (k * 4)) & 15) as usize], &mut n);
+        }
+        put(if exempt { b'X' } else { b'-' }, &mut n);
+        sig |= u64::from(exempt) << 31;
+        // SAFETY: single-threaded guest.
+        unsafe {
+            if LAST == sig {
+                return;
+            }
+            LAST = sig;
+        }
+        let mut out = [0u8; 160];
+        let mut m = 0usize;
+        let mut dec = |mut v: i32, out: &mut [u8; 160], m: &mut usize| {
+            if v < 0 { out[*m] = b'-'; *m += 1; v = -v; }
+            let mut t = [0u8; 11]; let mut k = 0;
+            loop { t[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+            while k > 0 { k -= 1; out[*m] = t[k]; *m += 1; }
+        };
+        for &b in b"GS t=" { out[m] = b; m += 1; }
+        dec(now as i32, &mut out, &mut m);
+        for &b in b" p=" { out[m] = b; m += 1; }
+        dec(player[0], &mut out, &mut m); out[m] = b','; m += 1;
+        dec(player[2], &mut out, &mut m); out[m] = b' '; m += 1;
+        for &b in &line[..n] { if m < 158 { out[m] = b; m += 1; } }
+        telemetry::debug_line(&out[..m]);
+    }
+
     /// The state of the level's visual switches, bit `i` set while slot `i`
     /// is on: the logic record each slot names, read as on or off. Planes,
     /// meshes and emitters cooked against a slot follow it.
