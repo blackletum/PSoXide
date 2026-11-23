@@ -36,11 +36,16 @@ use stage::{Ctx, Tier};
 
 const USAGE: &str = "\
 usage:
-  psoxide-test run [--repo DIR] [--tier quick|full] [--stage NAME]... [--all-models]
-      the pipeline (stages: build size host journeys speed cross clean); exit 0 only when every
-      check that ran passed, and for --tier full only when the landing verdict is complete
-  psoxide-test bless [--repo DIR]
-      measure the reference build and write psoxide-test.baseline.toml (refuses a red journey)
+  psoxide-test run [--repo DIR] [--tier quick|full] [--profile install|landing] [--stage NAME]... [--all-models] [--keep-going]
+      the pipeline (stages, in run order: build size host stack speed journeys cross clean); stops
+      a full tier at the first failed stage unless --keep-going; exit 0 only when every check that ran passed,
+      and for --tier full only when the landing verdict is complete. --profile landing (full tier
+      only, needs the owner's approval before lanes use it): journeys on real only, the speed
+      bar's landing slack; never installable. No --profile is install: the full tier unchanged
+  psoxide-test bless [--repo DIR] [--keep-speed]
+      measure the reference build and write psoxide-test.baseline.toml (refuses a red journey);
+      --keep-speed keeps the baseline's speed rows, refused unless a plain bless measured each on
+      searched layouts (or none) and its window identity is unchanged
   psoxide-test lint [--repo DIR]
       load the game file and every journey; print the pad and open-loop findings
   psoxide-test tape --disc CUE --press SCHEDULE --out TAPE --steps N [--stop-at-poll P] [--pad analog|dualshock|digital]
@@ -48,12 +53,32 @@ usage:
   psoxide-test pin [--repo DIR] [--write] [--pinned REV] [--main REV] [--crates]
       the SDK pin rule for the game: its pinned commit against SDK main (or REV), over the SDK
       crates the game reaches (--crates lists them); --write records the pin's guest tree
-  psoxide-test install [--repo DIR]
-      install the judged disc into the configured library (needs a complete full PASS)
+  psoxide-test install [--repo DIR] [--rebase-facts]
+      install the judged disc into the configured library (needs a complete clean full PASS on
+      the install profile, a searched layout, never slower per speed window than the build
+      installed before it, judged on the library's speed facts, which must describe the library's
+      disc; no facts is a first install only when the library holds no disc of that name).
+      --rebase-facts: when those facts cannot be compared, take this PASS as the new reference
+  psoxide-test install-check --result RESULT.json --repo GAME_CLONE --bin BIN [--map MAP]
+                             (--facts FACTS.json --library-bin LIBRARY.bin | --first-install)
+                             [--rebase-facts] [--write-facts OUT.json] [--stamp OUT.json]
+      the same guarantee for an install made elsewhere: exit 0 only if RESULT (named by its own
+      sha256) judged BIN and MAP, its committed layouts (read in GAME_CLONE at RESULT's commit)
+      were searched, and it is never slower than the installed build whose speed facts are
+      FACTS and whose disc is LIBRARY.bin. A missing FACTS is refused; --first-install says
+      there is none. --write-facts writes the new speed facts; --stamp (on success only) writes
+      the install marker a deploy script checks
 config: ~/.config/psoxide-test/config.toml or PSOXIDE_TEST_CONFIG (see config.example.toml)";
 
 const STAGES: &[&str] = &[
     "build", "requires", "size", "host", "journeys", "stack", "speed", "cross", "clean",
+];
+
+/// The order `run` plays the stages in: the cheap verdicts (size, host, stack, speed) before the
+/// journeys, which are most of a full tier's wall time, so a run that is going to fail on a
+/// cheap check says so in minutes. No stage reads another stage's output except through `build`.
+const RUN_ORDER: &[&str] = &[
+    "build", "requires", "size", "host", "stack", "speed", "journeys", "cross", "clean",
 ];
 
 fn main() -> ExitCode {
@@ -73,6 +98,17 @@ struct Options {
     stages: Vec<String>,
     /// `--all-models`: play every model of every journey, none standing on `real` (audit).
     all_models: bool,
+    /// `--keep-going`: play every stage even after one has failed (the old behaviour). By default
+    /// a full tier stops at its first failed stage and lists the rest as not run.
+    keep_going: bool,
+    /// `--profile`: the full tier's gates (stage::Profile); `Install` when not given.
+    profile: stage::Profile,
+    /// `--rebase-facts` (install only): when the installed build's speed facts cannot be compared
+    /// (another window identity, facts of another disc, or legacy facts), take this strict PASS
+    /// as the new reference instead of refusing. Never waives a comparison that can be made.
+    rebase_facts: bool,
+    /// `bless --keep-speed`: keep the baseline's speed rows (light landings on a greedy layout).
+    keep_speed: bool,
 }
 
 fn options(args: &[String]) -> Result<Options, String> {
@@ -81,6 +117,10 @@ fn options(args: &[String]) -> Result<Options, String> {
         tier: Tier::Quick,
         stages: Vec::new(),
         all_models: false,
+        keep_going: false,
+        keep_speed: false,
+        profile: stage::Profile::Install,
+        rebase_facts: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -88,6 +128,16 @@ fn options(args: &[String]) -> Result<Options, String> {
         match a.as_str() {
             "--repo" => o.repo = PathBuf::from(value()?),
             "--all-models" => o.all_models = true,
+            "--keep-going" => o.keep_going = true,
+            "--keep-speed" => o.keep_speed = true,
+            "--rebase-facts" => o.rebase_facts = true,
+            "--profile" => {
+                o.profile = match value()?.as_str() {
+                    "install" => stage::Profile::Install,
+                    "landing" => stage::Profile::Landing,
+                    p => return Err(format!("unknown profile `{p}` (install or landing)")),
+                }
+            }
             "--tier" => {
                 o.tier = match value()?.as_str() {
                     "quick" => Tier::Quick,
@@ -130,11 +180,13 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
     match command {
         Some("run") => {
             let o = options(&args[1..])?;
-            run(&o)
+            check_profile(&o, true)?;
+            run(&no_rebase(o)?)
         }
-        Some("bless") => bless(&options(&args[1..])?),
-        Some("lint") => lint(&options(&args[1..])?),
-        Some("install") => install(&options(&args[1..])?),
+        Some("bless") => bless(&no_rebase(checked(&args[1..])?)?),
+        Some("lint") => lint(&no_rebase(checked(&args[1..])?)?),
+        Some("install") => install(&checked(&args[1..])?),
+        Some("install-check") => stage::install::check_command(&args[1..]),
         Some("adapter") => adapter(&args[1..]),
         Some("pin") => pin_command(&args[1..]),
         Some("tape") => tape::run(&args[1..]),
@@ -144,6 +196,39 @@ fn dispatch(args: &[String]) -> Result<ExitCode, String> {
         }
         Some(other) => Err(format!("unknown command `{other}`\n{USAGE}")),
     }
+}
+
+/// `options` for a command other than `run`, which takes no landing profile.
+/// `--rebase-facts` is an `install` option only.
+fn no_rebase(o: Options) -> Result<Options, String> {
+    if o.rebase_facts {
+        Err("--rebase-facts is an `install` option only".into())
+    } else {
+        Ok(o)
+    }
+}
+
+fn checked(args: &[String]) -> Result<Options, String> {
+    let o = options(args)?;
+    check_profile(&o, false)?;
+    Ok(o)
+}
+
+/// `--profile landing` is a full-tier `run` option only, and not an audit (`--all-models`).
+fn check_profile(o: &Options, is_run: bool) -> Result<(), String> {
+    if o.profile == stage::Profile::Install {
+        return Ok(());
+    }
+    if !is_run {
+        return Err("--profile landing is a `run --tier full` option only".into());
+    }
+    if o.tier != Tier::Full {
+        return Err("--profile landing needs --tier full".into());
+    }
+    if o.all_models {
+        return Err("--profile landing plays journeys on real only: drop --all-models".into());
+    }
+    Ok(())
 }
 
 /// The `adapter` subcommands the harness runs in their own process.
@@ -211,7 +296,9 @@ fn context<'a>(o: &Options, game: &'a Game, config: &'a Config) -> Result<Ctx<'a
         receipts: Store::new(work.join("receipts")),
         work,
         tier: o.tier,
+        profile: o.profile,
         all_models: o.all_models,
+        rebase_facts: o.rebase_facts,
         artifacts: BTreeMap::new(),
         timing: Mutex::new(Vec::new()),
         originals: Mutex::new(originals::Cache::load(
@@ -235,6 +322,22 @@ fn not_run(name: &str, needs: &str) -> StageResult {
     }
 }
 
+/// A stage the run never started because an earlier stage failed.
+fn stopped_at(name: &str, failed: &str) -> StageResult {
+    StageResult {
+        name: name.into(),
+        source: Source::NotRun,
+        key: String::new(),
+        outcome: Outcome {
+            checks: vec![Check::fail(
+                name,
+                format!("not run: the run stopped at `{failed}`, which failed (--keep-going plays every stage)"),
+            )],
+            ..Outcome::default()
+        },
+    }
+}
+
 fn run(o: &Options) -> Result<ExitCode, String> {
     let config = Config::load()?;
     let game = Game::load(&o.repo)?;
@@ -250,24 +353,48 @@ fn run(o: &Options) -> Result<ExitCode, String> {
     // The SDK pin rule first: it is not a receipt (SDK main moves), and a run that cannot
     // show it is not a landing.
     let (sdk, sdk_guest) = ctx.timed("sdk", || sdk_stage(&o.repo, &game, config.work.as_path()));
+    // The first failed stage, once the run stops at it. Only a full tier stops: a quick tier is
+    // already cheap, and repin flows run it expecting a size or speed red before they bless.
+    // `--keep-going` never stops. A failed SDK pin does not stop the run: it judges the pin, not
+    // these bytes, and a lane may prove its bytes on an older pin on purpose.
+    let mut stopped: Option<String> = None;
     stages.push(sdk);
+    // A full tier whose clean clone cannot fetch this commit fails at its very end, after every
+    // journey: ask GitHub first. Only a definite "not there" stops the run.
+    if stopped.is_none() && o.tier == Tier::Full && wanted("clean") && !game.cleans.is_empty() {
+        let pre = ctx.timed("pushed", || stage::clean::pushed_precheck(&ctx));
+        if !pre.passed() && !o.keep_going {
+            stopped = Some("pushed".into());
+        }
+        stages.push(pre);
+    }
     let t0 = util::now_seconds();
-    let build = stage::build::run(&mut ctx);
-    ctx.timing
-        .lock()
-        .map_err(|_| "timing lock")?
-        .push(report::Timing {
-            what: "build".into(),
-            start: t0,
-            end: util::now_seconds(),
-        });
-    let built = build.passed();
-    stages.push(build);
-    for name in &STAGES[1..] {
+    let built = if let Some(at) = &stopped {
+        stages.push(stopped_at("build", at));
+        false
+    } else {
+        let build = stage::build::run(&mut ctx);
+        ctx.timing
+            .lock()
+            .map_err(|_| "timing lock")?
+            .push(report::Timing {
+                what: "build".into(),
+                start: t0,
+                end: util::now_seconds(),
+            });
+        let built = build.passed();
+        stages.push(build);
+        built
+    };
+    for name in &RUN_ORDER[1..] {
         if !wanted(name) {
             continue;
         }
         if optional_stage_absent(name, &game) {
+            continue;
+        }
+        if let Some(at) = &stopped {
+            stages.push(stopped_at(name, at));
             continue;
         }
         if !built {
@@ -283,9 +410,18 @@ fn run(o: &Options) -> Result<ExitCode, String> {
             "speed" => stage::speed::run(&ctx, false),
             "cross" => stage::cross::run(&ctx),
             "clean" => stage::clean::run(&ctx),
-            _ => unreachable!("STAGES lists only these"),
+            _ => unreachable!("RUN_ORDER lists only these"),
         });
+        if !r.passed() && !o.keep_going && o.tier == Tier::Full {
+            stopped = Some(name.to_string());
+        }
         stages.push(r);
+    }
+    if let Some(at) = &stopped {
+        println!(
+            "STOPPED at the first failed stage ({at}); the stages after it did not run \
+             (--keep-going plays them all)"
+        );
     }
     let mut missing = Vec::new();
     if o.tier != Tier::Full {
@@ -318,11 +454,9 @@ fn run(o: &Options) -> Result<ExitCode, String> {
     }
     missing.dedup();
     let commit = util::git(&o.repo, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
-    let dirty = !util::git(&o.repo, &["status", "--porcelain", "--untracked-files=no"])
-        .unwrap_or_default()
-        .is_empty();
+    let dirty = tree_dirty(&o.repo);
     let mut result = RunResult {
-        schema: 1,
+        schema: report::result_schema(o.profile),
         game: game.name.clone(),
         commit,
         dirty,
@@ -331,6 +465,7 @@ fn run(o: &Options) -> Result<ExitCode, String> {
         harness: env!("CARGO_PKG_VERSION").into(),
         gate_revision: GATE_REVISION.into(),
         tier: o.tier.name().into(),
+        profile: o.profile,
         stages,
         skips: Vec::new(),
         verdict: Status::Pass,
@@ -388,7 +523,7 @@ fn bless(o: &Options) -> Result<ExitCode, String> {
         blessed_commit: if dirty {
             format!("{commit}+dirty")
         } else {
-            commit
+            commit.clone()
         },
         sdk_pin: stage::sdk_pin(&o.repo, &game),
         ..Baseline::default()
@@ -477,6 +612,30 @@ fn bless(o: &Options) -> Result<ExitCode, String> {
             }
         }
     }
+    if o.keep_speed {
+        // Light landings (owner, 11-22): a greedy-layout build must not become the speed reference,
+        // or each landing's slack would stack on the last. Keep the rows the previous bless wrote
+        // (a searched layout) and measure nothing.
+        // The kept rows must come from a plain bless on searched layouts and still measure what
+        // the game file and config declare; their records travel with them unchanged.
+        let old = ctx
+            .baseline
+            .as_ref()
+            .ok_or("--keep-speed needs a baseline: run a plain bless on a searched layout")?;
+        let now = stage::install::window_identities(&o.repo, &commit, &game, GATE_REVISION)?;
+        base.speed = baseline::kept_speed(old, &now)?;
+        base.save(&o.repo)?;
+        println!(
+            "blessed {} into {} KEEPING the previous speed rows ({} windows, not re-measured; \
+             --keep-speed); size {:?}, {} journeys",
+            util::short(&base.blessed_commit),
+            game::BASELINE_FILE,
+            base.speed.len(),
+            base.size,
+            base.journeys.len()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     let speed = stage::speed::run(&ctx, true);
     // Before reading the windows: a stage that could not measure says why (not "no flips").
     let broken: Vec<&Check> = speed
@@ -505,9 +664,29 @@ fn bless(o: &Options) -> Result<ExitCode, String> {
         .iter()
         .flat_map(|w| w.rows().into_iter().map(move |(row, _)| (row, w)))
         .collect();
+    // What each row measured, recorded so `--keep-speed` can later prove the rows it keeps came
+    // from a searched layout and still measure the same thing. A record that cannot be read
+    // (a tape or layout the commit does not hold) is left out, with a warning: the row is then
+    // never kept.
+    let identities = stage::install::window_identities(&o.repo, &commit, &game, GATE_REVISION)
+        .map_err(|e| eprintln!("warning: no window identity recorded: {e}"))
+        .ok();
     for (row, w) in rows {
+        let layouts = game
+            .build(&w.build)
+            .map(|b| layout_records(&o.repo, &commit, b));
+        let layouts = match layouts {
+            Some(Ok(l)) => Some(l),
+            Some(Err(e)) => {
+                eprintln!("warning: no layout provenance recorded for `{row}`: {e}");
+                None
+            }
+            None => None,
+        };
         let mut table = WindowBase {
             offsets: w.offsets.clone(),
+            layouts,
+            identity: identities.as_ref().and_then(|i| i.get(&row).cloned()),
             ..WindowBase::default()
         };
         for off in &w.offsets {
@@ -536,6 +715,26 @@ fn bless(o: &Options) -> Result<ExitCode, String> {
         base.journeys.len()
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// The layout profiles `build` links at `commit`, recorded for the baseline: path, SHA-256 and
+/// search stamp.
+fn layout_records(
+    repo: &Path,
+    commit: &str,
+    build: &game::Build,
+) -> Result<Vec<baseline::LayoutRecord>, String> {
+    stage::install::committed_layouts(repo, commit, build)?
+        .into_iter()
+        .map(|l| {
+            Ok(baseline::LayoutRecord {
+                sha256: util::git_blob_sha256(repo, commit, &l.path)?,
+                searched: stage::install::search_stamp(&l.text)
+                    .map(|(rounds, seed)| baseline::SearchStamp { rounds, seed }),
+                path: l.path,
+            })
+        })
+        .collect()
 }
 
 fn print_stage(s: &StageResult) {
@@ -821,4 +1020,80 @@ fn pin_command(args: &[String]) -> Result<ExitCode, String> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Whether the repo's tracked files differ from HEAD. A git that cannot answer (not a repository,
+/// git missing) counts as dirty: the clean-tree refusal must never pass on an error.
+fn tree_dirty(repo: &Path) -> bool {
+    util::git(repo, &["status", "--porcelain", "--untracked-files=no"])
+        .map_or(true, |status| !status.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_git_reads_as_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a repository: git fails, and that is dirty, never clean.
+        assert!(tree_dirty(&dir.path().join("missing")));
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("f"), "a").unwrap();
+        git(&["add", "f"]);
+        git(&["commit", "-q", "-m", "c"]);
+        assert!(!tree_dirty(dir.path()));
+        std::fs::write(dir.path().join("f"), "b").unwrap();
+        assert!(tree_dirty(dir.path()));
+    }
+
+    #[test]
+    fn only_landing_results_carry_schema_2() {
+        assert_eq!(report::result_schema(stage::Profile::Install), 1);
+        assert_eq!(report::result_schema(stage::Profile::Landing), 2);
+        assert_eq!(report::RESULT_SCHEMA_MAX, 2);
+    }
+
+    fn parse(args: &[&str]) -> Result<Options, String> {
+        let dir = std::env::temp_dir().display().to_string();
+        let mut all: Vec<String> = vec!["--repo".into(), dir];
+        all.extend(args.iter().map(|s| s.to_string()));
+        options(&all)
+    }
+
+    #[test]
+    fn no_profile_is_the_install_profile() {
+        let o = parse(&["--tier", "full"]).unwrap();
+        assert_eq!(o.profile, stage::Profile::Install);
+        assert!(check_profile(&o, true).is_ok());
+        let explicit = parse(&["--tier", "full", "--profile", "install"]).unwrap();
+        assert_eq!(explicit.profile, o.profile);
+    }
+
+    #[test]
+    fn landing_is_a_full_tier_run_option_only() {
+        let o = parse(&["--tier", "full", "--profile", "landing"]).unwrap();
+        assert_eq!(o.profile, stage::Profile::Landing);
+        assert!(check_profile(&o, true).is_ok());
+        assert!(
+            check_profile(&o, false).is_err(),
+            "bless and install refuse it"
+        );
+        let quick = parse(&["--profile", "landing"]).unwrap();
+        assert!(check_profile(&quick, true).is_err());
+        let audit = parse(&["--tier", "full", "--profile", "landing", "--all-models"]).unwrap();
+        assert!(check_profile(&audit, true).is_err());
+        assert!(parse(&["--profile", "fast"]).is_err());
+    }
 }

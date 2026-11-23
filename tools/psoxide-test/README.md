@@ -11,9 +11,13 @@ result file per run, the clean-clone proof and the install.
 psoxide-test run --tier full      # everything a landing needs; exit 0 only on LANDING: COMPLETE PASS
 psoxide-test run                  # the quick pre-check (build, size, one window, precheck journeys)
 psoxide-test run --stage journeys # one stage (the build always runs first, usually as a receipt)
-psoxide-test bless                # measure the reference build, write the baseline
+psoxide-test bless [--keep-speed] # measure the reference build, write the baseline (speed rows
+                                  # record their layouts' sha256 and search stamp and the window
+                                  # identity; --keep-speed keeps them, only when every row came
+                                  # from searched layouts or none and its identity is unchanged)
 psoxide-test lint                 # load the file and every journey; pads and open-loop counts
-psoxide-test install              # copy bytes a complete full PASS judged into the library
+psoxide-test install [--rebase-facts] # copy bytes a complete full PASS judged into the library
+psoxide-test install-check ...    # the install guarantee for a script's install (see Gate profiles)
 psoxide-test pin [--write]        # the SDK pin rule for this repo
 ```
 
@@ -70,6 +74,102 @@ LANDING: COMPLETE PASS (every required tier ran on these bytes and passed)
   otherwise the last line lists what is missing.
 - The result is `<work>/<game>/results/<sha256>.json`, named by its content; wall times are in
   `<sha256>.timing.json` beside it. `install` and `[[requires]]` name results by that hash.
+
+## Gate profiles and the install guarantee
+
+**Needs the owner's approval before any lane uses `--profile landing`.** Without `--profile` a full
+tier is exactly what it was before profiles existed (the result file is byte-identical: an
+install-profile result writes no `profile` key).
+
+```
+psoxide-test run --tier full                     # = --profile install: the strict full tier
+psoxide-test run --tier full --profile landing   # lighter, opt-in, never installable
+```
+
+| | `install` (default) | `landing` |
+|---|---|---|
+| journeys | every model in `FULL_MODELS` | `real` only; every other model is a skip row naming the landing profile (never a pass) |
+| speed rows | every row: the window (the console model, `real`) and each `models` row | the window's `real` row only; each `<name>@<model>` row is a skip naming the landing profile, not measured |
+| speed: work per frame, frames presented | mean worse-by over the offsets <= the blessed phase spread | the same, plus `landing_work_slack_permille` thousandths of the blessed mean (per `[[speed]]` window, default 50 = 5%): work may rise and flips may drop by that much |
+| speed: p99 | judged as above | reported as a skip (value and baseline kept), not judged |
+| frames by vblank count | reported, not judged | the same |
+| result JSON | `"schema": 1`, no `profile` key (byte-identical to results before profiles) | `"schema": 2`, `"profile": "landing"`; the verdict line reads `LANDING-PROFILE PASS ... NOT an install pass` |
+
+`--profile landing` is refused outside `run --tier full`, and with `--all-models`. A disc image run
+on the install profile refuses a `[[requires]]` member whose result is landing-profile.
+
+The install guarantee (`install`, and `install-check` for installs made by a script) refuses
+unless the result is a complete, clean, full PASS on the install profile, with a result
+`schema` this harness knows (a newer one is refused), and refuses a result slower than the build
+installed before it. Only a psoxide-test from this revision on may install: older binaries
+ignore the `profile` key and would install a landing result.
+
+Never slower: for every speed row the installed build was judged on whose identity matches, over
+the offsets both measured, mean work per frame and p99 not above and mean frames presented not
+below the installed build's, within its own phase spread (the strict tolerance, no slack). Such
+a row the new result lacks is refused. The facts live beside the installed disc as
+`<Name>.speed-facts.json`, bound to the disc they describe:
+
+```
+{"schema": 2, "result_sha256": "<hex>", "bin_sha256": "<hex>", "map_sha256": "<hex>"|null,
+ "windows": {"<row>": {"offsets": [-12, 0, 12], "flips": [...], "work_per_frame": [...],
+   "frame_work_p99": [...],
+   "identity": {"tape": "<path>", "tape_sha256": "<hex>", "window": "polls A..B",
+                "offsets": [-12, 0, 12], "launch_args": [...], "gate_revision": "<sha>"}}}}
+```
+
+`window` is `polls A..B`, or `located from <cond> until <cond> max_polls N` for a window found by
+conditions; the tape is hashed at the result's commit. A result does not carry the frontend's or
+psoxide-pgo's sha256, so the emulator is named by the gate revision. The facts are compared only
+when they describe the library's bin (`bin_sha256`) and the row's identity is unchanged. When they
+cannot be compared (a disc in the library without facts, schema-1 facts, facts of another bin, a
+moved window, a new tape or gate) the install is refused; `--rebase-facts` takes the strict PASS
+as the new reference instead and says so loudly. It never waives a comparison that can be made.
+
+`install` reads the library's own facts: none and no disc of that name is the first install;
+a disc without facts is refused. A script's install runs `install-check`:
+
+```
+psoxide-test install-check --result RESULT.json --repo GAME_CLONE --bin BIN [--map MAP]
+    (--facts LIBRARY/<Name>.speed-facts.json --library-bin LIBRARY/<Name>.bin | --first-install)
+    [--rebase-facts] [--write-facts OUT.json] [--stamp OUT.json]
+```
+
+- `--result`: a result file named `<sha256 of its content>.json`, as `run` writes it; any other
+  name is refused.
+- `--repo`: a clone of the game holding the result's commit; the game file, layouts and tapes are
+  read there, at that commit.
+- `--bin`, `--map`: the files about to be installed. The bin must be an `[[install]]` build's bin
+  as the result's build stage recorded it, the map that build's recorded map (`--map` is needed
+  exactly when the build declares a map).
+- `--facts`, `--library-bin`: the library's facts and bin. Missing facts are refused (a typo must
+  not disable never-slower) unless `--first-install` says there are none; `--first-install` is
+  itself refused when either path exists.
+- `--write-facts` writes the new facts; `--stamp` writes, on success only, the marker a deploy
+  script checks before it copies a bin (it copies only a bin whose sha256 is the stamp's):
+
+```
+{"schema": 1, "result_sha256": "<hex>", "bin_sha256": "<hex>", "map_sha256": "<hex>"|null,
+ "profile": "install", "checked_at": "2026-11-22T12:34:56Z", "facts": {<the new facts>}}
+```
+
+Exit 0 only on PASS.
+
+The install also needs a searched layout. Every committed psoxide-pgo layout profile of the
+installed builds must carry the search stamp that `psoxide-pgo search` writes as its second
+line (format defined in tools/psoxide-pgo, README "The search stamp"):
+
+```
+# psoxide-pgo layout 1
+# psoxide-pgo searched: rounds <N> seed <N>
+```
+
+The layouts are read at the result's commit: a `[[build]]`'s `layout_files` (paths in the repo),
+or when it names none every tracked `*.layout` file whose first line is `# psoxide-pgo layout
+1`. A game with no layout profile passes; a build with `layout = false` has none. A layout from
+`order` or `layout` (greedy), or one searched before the stamp existed, is refused: run the
+game's layout search on the commit (`psoxide-pgo search ... --start recorded` continues from the
+committed placement), commit the layout, bless, and run the full tier on that commit.
 
 ## Receipts and the SDK pin
 
